@@ -15,6 +15,7 @@ keepass = { version = "0.10", features = ["save_kdbx4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "5"
+tokio = { version = "1", features = ["rt"] }
 
 [dependencies.i18n-embed]
 version = "0.15"

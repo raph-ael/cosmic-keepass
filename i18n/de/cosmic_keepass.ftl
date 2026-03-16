@@ -13,6 +13,7 @@ settings = Einstellungen
 
 # Unlock
 master-password-placeholder = Master-Passwort...
+unlocking = Datenbank wird entsperrt...
 unlock-error = Entsperren fehlgeschlagen: {$error}
 db-not-configured = Keine Datenbank konfiguriert
 
@@ -38,3 +39,19 @@ save = Speichern
 close = Schließen
 status-saved = Einstellungen gespeichert!
 auto-lock-label = Automatisch sperren nach (Minuten, 0 = nie)
+
+# Entry list
+show-all = Alle Passwörter anzeigen
+hide-all = Passwörter ausblenden
+new-entry = Neues Passwort
+
+# New entry window
+new-entry-title = Neues Passwort anlegen
+entry-title-label = Titel
+entry-title-placeholder = z.B. GitHub
+entry-username-placeholder = Benutzername oder E-Mail
+entry-password-placeholder = Passwort
+entry-url-placeholder = https://...
+entry-notes-placeholder = Notizen (optional)
+entry-title-required = Titel ist erforderlich
+entry-saved = Eintrag gespeichert!

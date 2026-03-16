@@ -7,23 +7,30 @@ use cosmic::iced_winit::commands::popup::{destroy_popup, get_popup};
 use cosmic::prelude::*;
 use cosmic::widget;
 
+const SEARCH_INPUT_ID: &str = "keepass-search";
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockState {
+    Locked,
+    Unlocking,
+    Unlocked,
+}
 
 pub struct AppModel {
     core: cosmic::Core,
     popup: Option<Id>,
     config: config::Config,
-    // Database state
     entries: Vec<KpEntry>,
-    unlocked: bool,
+    lock_state: LockState,
     password_input: String,
     search_input: String,
+    show_all: bool,
     status_text: String,
-    // Detail view
     detail_entry: Option<KpEntry>,
-    // Auto-lock
     last_activity: Instant,
 }
 
@@ -33,13 +40,17 @@ pub enum Message {
     PopupClosed(Id),
     PasswordInput(String),
     Unlock,
+    UnlockDone(Result<Vec<KpEntry>, String>),
     Lock,
     SearchInput(String),
+    ToggleShowAll,
     CopyPassword(usize),
     CopyUsername(usize),
     ShowDetails(usize),
     CloseDetails,
     OpenSettings,
+    OpenNewEntry,
+    FocusSearch,
 }
 
 fn copy_to_clipboard(text: &str) {
@@ -79,9 +90,10 @@ impl cosmic::Application for AppModel {
             popup: None,
             config: cfg,
             entries: Vec::new(),
-            unlocked: false,
+            lock_state: LockState::Locked,
             password_input: String::new(),
             search_input: String::new(),
+            show_all: false,
             status_text: String::new(),
             detail_entry: None,
             last_activity: Instant::now(),
@@ -94,10 +106,10 @@ impl cosmic::Application for AppModel {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        let icon = if self.unlocked {
-            "channel-insecure-symbolic"
+        let icon = if self.lock_state == LockState::Unlocked {
+            "changes-allow-symbolic"
         } else {
-            "channel-secure-symbolic"
+            "changes-prevent-symbolic"
         };
 
         self.core
@@ -109,19 +121,17 @@ impl cosmic::Application for AppModel {
 
     fn view_window(&self, _id: Id) -> Element<'_, Self::Message> {
         let content: Element<'_, Self::Message> = if let Some(entry) = &self.detail_entry {
-            // Detail view
             self.view_details(entry)
-        } else if !self.unlocked {
-            // Unlock view
-            self.view_unlock()
         } else {
-            // Entry list view
-            self.view_entries()
+            match self.lock_state {
+                LockState::Locked => self.view_unlock(),
+                LockState::Unlocking => self.view_unlocking(),
+                LockState::Unlocked => self.view_entries(),
+            }
         };
 
         let cosmic = self.core.system_theme().cosmic();
-        let pad =
-            cosmic::iced::Padding::from([cosmic.space_xxs() as u16, cosmic.space_xs() as u16]);
+        let pad = cosmic::iced::Padding::from([cosmic.space_xxs() as u16, 0]);
 
         self.core
             .applet
@@ -140,11 +150,12 @@ impl cosmic::Application for AppModel {
                 } else {
                     self.config = config::load_config();
 
-                    // Auto-lock check
-                    if self.unlocked && self.config.auto_lock_minutes > 0 {
+                    if self.lock_state == LockState::Unlocked
+                        && self.config.auto_lock_minutes > 0
+                    {
                         let elapsed = self.last_activity.elapsed().as_secs() / 60;
                         if elapsed >= self.config.auto_lock_minutes as u64 {
-                            self.unlocked = false;
+                            self.lock_state = LockState::Locked;
                             self.entries.clear();
                             self.password_input.clear();
                         }
@@ -152,6 +163,8 @@ impl cosmic::Application for AppModel {
 
                     self.status_text.clear();
                     self.detail_entry = None;
+                    self.show_all = false;
+                    self.search_input.clear();
 
                     let new_id = Id::unique();
                     self.popup.replace(new_id);
@@ -162,7 +175,18 @@ impl cosmic::Application for AppModel {
                         None,
                         None,
                     );
-                    get_popup(popup_settings)
+                    let popup_task = get_popup(popup_settings);
+
+                    // Schedule focus after popup renders
+                    if self.lock_state == LockState::Unlocked {
+                        let focus_task = Task::perform(
+                            async { tokio::time::sleep(std::time::Duration::from_millis(200)).await },
+                            |_| cosmic::Action::App(Message::FocusSearch),
+                        );
+                        return Task::batch(vec![popup_task, focus_task]);
+                    }
+
+                    popup_task
                 };
             }
             Message::PopupClosed(id) => {
@@ -179,42 +203,65 @@ impl cosmic::Application for AppModel {
                     self.status_text = fl!("db-not-configured");
                     return Task::none();
                 }
-                match kdbx::open_database(&self.config.db_path, &self.password_input) {
-                    Ok(entries) => {
-                        self.entries = entries;
-                        self.unlocked = true;
-                        self.status_text.clear();
-                        self.password_input.clear();
-                    }
-                    Err(e) => {
-                        self.status_text = fl!("unlock-error", error = e.as_str());
-                    }
-                }
+                self.lock_state = LockState::Unlocking;
+                self.status_text.clear();
+
+                let db_path = self.config.db_path.clone();
+                let password = self.password_input.clone();
+
+                return Task::perform(
+                    async move {
+                        // Run blocking DB open in a thread
+                        tokio::task::spawn_blocking(move || {
+                            kdbx::open_database(&db_path, &password)
+                        })
+                        .await
+                        .map_err(|e| format!("{e}"))?
+                    },
+                    |result| cosmic::Action::App(Message::UnlockDone(result)),
+                );
             }
+            Message::UnlockDone(result) => match result {
+                Ok(entries) => {
+                    self.entries = entries;
+                    self.lock_state = LockState::Unlocked;
+                    self.status_text.clear();
+                    self.password_input.clear();
+                }
+                Err(e) => {
+                    self.lock_state = LockState::Locked;
+                    self.status_text = fl!("unlock-error", error = e.as_str());
+                }
+            },
             Message::Lock => {
-                self.unlocked = false;
+                self.lock_state = LockState::Locked;
                 self.entries.clear();
                 self.password_input.clear();
                 self.search_input.clear();
+                self.show_all = false;
                 self.detail_entry = None;
             }
             Message::SearchInput(q) => {
                 self.search_input = q;
+                self.show_all = false;
+            }
+            Message::ToggleShowAll => {
+                self.show_all = !self.show_all;
             }
             Message::CopyPassword(idx) => {
-                if let Some(entry) = self.filtered_entries().get(idx) {
+                if let Some(entry) = self.visible_entries().get(idx) {
                     copy_to_clipboard(&entry.password);
-                    self.status_text = fl!("copied");
+                    self.search_input = fl!("copied");
                 }
             }
             Message::CopyUsername(idx) => {
-                if let Some(entry) = self.filtered_entries().get(idx) {
+                if let Some(entry) = self.visible_entries().get(idx) {
                     copy_to_clipboard(&entry.username);
-                    self.status_text = fl!("copied");
+                    self.search_input = fl!("copied");
                 }
             }
             Message::ShowDetails(idx) => {
-                if let Some(entry) = self.filtered_entries().get(idx) {
+                if let Some(entry) = self.visible_entries().get(idx) {
                     self.detail_entry = Some(entry.clone());
                 }
             }
@@ -224,6 +271,17 @@ impl cosmic::Application for AppModel {
             Message::OpenSettings => {
                 let _ = Command::new("cosmic-keepass")
                     .arg("--settings")
+                    .spawn();
+                if let Some(p) = self.popup.take() {
+                    return destroy_popup(p);
+                }
+            }
+            Message::FocusSearch => {
+                return widget::text_input::focus(widget::Id::new(SEARCH_INPUT_ID));
+            }
+            Message::OpenNewEntry => {
+                let _ = Command::new("cosmic-keepass")
+                    .arg("--new-entry")
                     .spawn();
                 if let Some(p) = self.popup.take() {
                     return destroy_popup(p);
@@ -239,9 +297,12 @@ impl cosmic::Application for AppModel {
 }
 
 impl AppModel {
-    fn filtered_entries(&self) -> Vec<KpEntry> {
-        if self.search_input.is_empty() {
+    fn visible_entries(&self) -> Vec<KpEntry> {
+        if self.show_all {
             return self.entries.clone();
+        }
+        if self.search_input.is_empty() {
+            return Vec::new();
         }
         let q = self.search_input.to_lowercase();
         self.entries
@@ -256,14 +317,20 @@ impl AppModel {
     }
 
     fn view_unlock(&self) -> Element<'_, Message> {
-        let pw_field = widget::text_input(fl!("master-password-placeholder"), &self.password_input)
-            .on_input(Message::PasswordInput)
-            .on_submit(|_| Message::Unlock)
-            .password();
+        let cosmic_theme = self.core.system_theme().cosmic();
+        let hpad = cosmic_theme.space_xs() as u16;
+
+        let pw_field = widget::container(
+            widget::text_input(fl!("master-password-placeholder"), &self.password_input)
+                .on_input(Message::PasswordInput)
+                .on_submit(|_| Message::Unlock)
+                .password(),
+        )
+        .padding([0, hpad]);
 
         let unlock_btn = cosmic::applet::menu_button(
             widget::row::with_children(vec![
-                widget::icon::from_name("channel-insecure-symbolic")
+                widget::icon::from_name("changes-allow-symbolic")
                     .size(16)
                     .icon()
                     .into(),
@@ -299,10 +366,68 @@ impl AppModel {
         widget::column::with_children(items).spacing(4).into()
     }
 
-    fn view_entries(&self) -> Element<'_, Message> {
-        let search = widget::text_input(fl!("search-placeholder"), &self.search_input)
-            .on_input(Message::SearchInput);
+    fn view_unlocking(&self) -> Element<'_, Message> {
+        let cosmic_theme = self.core.system_theme().cosmic();
+        let hpad = cosmic_theme.space_xs() as u16;
 
+        let loading_field = widget::container(
+            widget::text_input(fl!("unlocking"), ""),
+        )
+        .padding([0, hpad]);
+
+        widget::column::with_children(vec![loading_field.into()])
+            .spacing(4)
+            .into()
+    }
+
+    fn view_entries(&self) -> Element<'_, Message> {
+        // Top: new entry button
+        let new_entry_btn = cosmic::applet::menu_button(
+            widget::row::with_children(vec![
+                widget::icon::from_name("list-add-symbolic")
+                    .size(16)
+                    .icon()
+                    .into(),
+                widget::text(fl!("new-entry")).size(14).into(),
+            ])
+            .spacing(8),
+        )
+        .on_press(Message::OpenNewEntry);
+
+        // Search (with horizontal padding)
+        let cosmic_theme = self.core.system_theme().cosmic();
+        let hpad = cosmic_theme.space_xs() as u16;
+        let search = widget::container(
+            widget::text_input(fl!("search-placeholder"), &self.search_input)
+                .on_input(Message::SearchInput)
+                .id(widget::Id::new(SEARCH_INPUT_ID)),
+        )
+        .padding([0, hpad]);
+
+        // Show/hide all toggle
+        let toggle_label = if self.show_all {
+            fl!("hide-all")
+        } else {
+            fl!("show-all")
+        };
+        let toggle_icon = if self.show_all {
+            "view-conceal-symbolic"
+        } else {
+            "view-list-symbolic"
+        };
+        let show_all_btn = cosmic::applet::menu_button(
+            widget::row::with_children(vec![
+                widget::icon::from_name(toggle_icon)
+                    .size(16)
+                    .icon()
+                    .into(),
+                widget::text(toggle_label).size(14).into(),
+            ])
+            .spacing(8),
+        )
+        .on_press(Message::ToggleShowAll);
+
+        // Bottom buttons
         let lock_btn = cosmic::applet::menu_button(
             widget::row::with_children(vec![
                 widget::icon::from_name("system-lock-screen-symbolic")
@@ -327,81 +452,81 @@ impl AppModel {
         )
         .on_press(Message::OpenSettings);
 
-        let filtered = self.filtered_entries();
+        let mut items: Vec<Element<'_, Message>> = vec![search.into()];
 
-        let entry_items: Vec<Element<'_, Message>> = if filtered.is_empty() {
-            vec![widget::text(fl!("no-entries")).size(13).into()]
-        } else {
-            filtered
-                .iter()
-                .enumerate()
-                .map(|(idx, entry)| {
-                    let title = widget::text(entry.title.clone()).size(14);
-                    let subtitle = widget::text(entry.username.clone()).size(11);
+        // Entry list directly below search
+        if !self.search_input.is_empty() || self.show_all {
+            let visible = self.visible_entries();
+            let entry_items: Vec<Element<'_, Message>> = if visible.is_empty() {
+                vec![
+                    cosmic::applet::menu_button(widget::text(fl!("no-entries")).size(14)).into(),
+                ]
+            } else {
+                visible
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, entry)| {
+                        let mut title = entry.title.clone();
+                        if title.len() > 25 {
+                            title.truncate(22);
+                            title.push_str("...");
+                        }
 
-                    let pw_btn = widget::button::icon(
-                        widget::icon::from_name("dialog-password-symbolic").size(14),
-                    )
-                    .on_press(Message::CopyPassword(idx));
+                        let pw_btn = widget::button::icon(
+                            widget::icon::from_name("dialog-password-symbolic").size(14),
+                        )
+                        .on_press(Message::CopyPassword(idx));
 
-                    let user_btn = widget::button::icon(
-                        widget::icon::from_name("system-users-symbolic").size(14),
-                    )
-                    .on_press(Message::CopyUsername(idx));
+                        let user_btn = widget::button::icon(
+                            widget::icon::from_name("system-users-symbolic").size(14),
+                        )
+                        .on_press(Message::CopyUsername(idx));
 
-                    let detail_btn = widget::button::icon(
-                        widget::icon::from_name("view-more-symbolic").size(14),
-                    )
-                    .on_press(Message::ShowDetails(idx));
+                        let detail_btn = widget::button::icon(
+                            widget::icon::from_name("view-more-symbolic").size(14),
+                        )
+                        .on_press(Message::ShowDetails(idx));
 
-                    let left = widget::column::with_children(vec![title.into(), subtitle.into()])
-                        .spacing(2);
-
-                    let buttons =
-                        widget::row::with_children(vec![
+                        let buttons = widget::row::with_children(vec![
                             pw_btn.into(),
                             user_btn.into(),
                             detail_btn.into(),
                         ])
-                        .spacing(4);
+                        .spacing(4)
+                        .align_y(cosmic::iced::Alignment::Center);
 
-                    widget::row::with_children(vec![
-                        left.into(),
-                        widget::Space::new().width(cosmic::iced::Length::Fill).into(),
-                        buttons.into(),
-                    ])
-                    .spacing(8)
-                    .into()
-                })
-                .collect()
-        };
+                        cosmic::applet::menu_button(
+                            widget::row::with_children(vec![
+                                widget::text(title).size(14).into(),
+                                widget::Space::new()
+                                    .width(cosmic::iced::Length::Fill)
+                                    .into(),
+                                buttons.into(),
+                            ])
+                            .spacing(8)
+                            .align_y(cosmic::iced::Alignment::Center),
+                        )
+                        .into()
+                    })
+                    .collect()
+            };
 
-        let entry_list =
-            widget::scrollable(widget::column::with_children(entry_items).spacing(6));
-
-        let mut items: Vec<Element<'_, Message>> = vec![
-            search.into(),
-            widget::divider::horizontal::default().into(),
-        ];
-
-        items.push(entry_list.into());
-
-        items.push(widget::divider::horizontal::default().into());
-
-        let bottom = widget::row::with_children(vec![lock_btn.into(), settings_btn.into()])
-            .spacing(0);
-        items.push(bottom.into());
-
-        if !self.status_text.is_empty() {
-            items.push(widget::text(&self.status_text).size(12).into());
+            items.push(
+                widget::scrollable(widget::column::with_children(entry_items)).into(),
+            );
         }
 
-        widget::column::with_children(items).spacing(4).into()
+        items.push(new_entry_btn.into());
+        items.push(show_all_btn.into());
+        items.push(widget::divider::horizontal::default().into());
+        items.push(lock_btn.into());
+        items.push(settings_btn.into());
+
+        widget::column::with_children(items).spacing(0).into()
     }
 
     fn view_details(&self, entry: &KpEntry) -> Element<'_, Message> {
         let title = widget::text::title4(entry.title.clone());
-
         let username = entry.username.clone();
         let url = entry.url.clone();
         let notes = entry.notes.clone();
@@ -412,15 +537,21 @@ impl AppModel {
             widget::column::with_children(vec![
                 widget::text(fl!("details-username")).size(11).into(),
                 widget::text(username).size(14).into(),
-            ]).spacing(2).into(),
+            ])
+            .spacing(2)
+            .into(),
             widget::column::with_children(vec![
                 widget::text(fl!("details-password")).size(11).into(),
                 widget::text("••••••••").size(14).into(),
-            ]).spacing(2).into(),
+            ])
+            .spacing(2)
+            .into(),
             widget::column::with_children(vec![
                 widget::text(fl!("details-url")).size(11).into(),
                 widget::text(url).size(14).into(),
-            ]).spacing(2).into(),
+            ])
+            .spacing(2)
+            .into(),
         ];
 
         if !notes.is_empty() {
@@ -428,16 +559,17 @@ impl AppModel {
                 widget::column::with_children(vec![
                     widget::text(fl!("details-notes")).size(11).into(),
                     widget::text(notes).size(14).into(),
-                ]).spacing(2).into(),
+                ])
+                .spacing(2)
+                .into(),
             );
         }
 
         items.push(widget::divider::horizontal::default().into());
 
-        let close_btn = cosmic::applet::menu_button(
-            widget::text(fl!("details-close")).size(14),
-        )
-        .on_press(Message::CloseDetails);
+        let close_btn =
+            cosmic::applet::menu_button(widget::text(fl!("details-close")).size(14))
+                .on_press(Message::CloseDetails);
 
         items.push(close_btn.into());
 
