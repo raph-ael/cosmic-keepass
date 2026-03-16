@@ -258,7 +258,7 @@ impl AppModel {
     fn view_unlock(&self) -> Element<'_, Message> {
         let pw_field = widget::text_input(fl!("master-password-placeholder"), &self.password_input)
             .on_input(Message::PasswordInput)
-            .on_submit(Message::Unlock)
+            .on_submit(|_| Message::Unlock)
             .password();
 
         let unlock_btn = cosmic::applet::menu_button(
@@ -336,8 +336,8 @@ impl AppModel {
                 .iter()
                 .enumerate()
                 .map(|(idx, entry)| {
-                    let title = widget::text(&entry.title).size(14);
-                    let subtitle = widget::text(&entry.username).size(11);
+                    let title = widget::text(entry.title.clone()).size(14);
+                    let subtitle = widget::text(entry.username.clone()).size(11);
 
                     let pw_btn = widget::button::icon(
                         widget::icon::from_name("dialog-password-symbolic").size(14),
@@ -367,7 +367,7 @@ impl AppModel {
 
                     widget::row::with_children(vec![
                         left.into(),
-                        widget::horizontal_space().into(),
+                        widget::Space::new().width(cosmic::iced::Length::Fill).into(),
                         buttons.into(),
                     ])
                     .spacing(8)
@@ -400,27 +400,36 @@ impl AppModel {
     }
 
     fn view_details(&self, entry: &KpEntry) -> Element<'_, Message> {
-        let title = widget::text::title4(&entry.title);
+        let title = widget::text::title4(entry.title.clone());
 
-        let make_row = |label: String, value: &str| -> Element<'_, Message> {
-            widget::column::with_children(vec![
-                widget::text(label).size(11).into(),
-                widget::text(value).size(14).into(),
-            ])
-            .spacing(2)
-            .into()
-        };
+        let username = entry.username.clone();
+        let url = entry.url.clone();
+        let notes = entry.notes.clone();
 
         let mut items: Vec<Element<'_, Message>> = vec![
             title.into(),
             widget::divider::horizontal::default().into(),
-            make_row(fl!("details-username"), &entry.username),
-            make_row(fl!("details-password"), "••••••••"),
-            make_row(fl!("details-url"), &entry.url),
+            widget::column::with_children(vec![
+                widget::text(fl!("details-username")).size(11).into(),
+                widget::text(username).size(14).into(),
+            ]).spacing(2).into(),
+            widget::column::with_children(vec![
+                widget::text(fl!("details-password")).size(11).into(),
+                widget::text("••••••••").size(14).into(),
+            ]).spacing(2).into(),
+            widget::column::with_children(vec![
+                widget::text(fl!("details-url")).size(11).into(),
+                widget::text(url).size(14).into(),
+            ]).spacing(2).into(),
         ];
 
-        if !entry.notes.is_empty() {
-            items.push(make_row(fl!("details-notes"), &entry.notes));
+        if !notes.is_empty() {
+            items.push(
+                widget::column::with_children(vec![
+                    widget::text(fl!("details-notes")).size(11).into(),
+                    widget::text(notes).size(14).into(),
+                ]).spacing(2).into(),
+            );
         }
 
         items.push(widget::divider::horizontal::default().into());
